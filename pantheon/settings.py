@@ -688,6 +688,22 @@ class Settings:
         return self._settings.get("default_template_auto_update", True)
 
     @property
+    def default_team_template(self) -> str:
+        """Template id used when a new chat has no stored team and the LLM dispatcher
+        either is disabled or cannot pick a better match. Defaults to "default".
+        """
+        self._ensure_loaded()
+        return self._settings.get("default_team_template", "default")
+
+    @property
+    def team_dispatcher_enabled(self) -> bool:
+        """Whether the LLM-based TeamDispatcher runs on the first message of a new chat
+        to auto-select a specialist team template. Defaults to True.
+        """
+        self._ensure_loaded()
+        return self._settings.get("team_dispatcher_enabled", True)
+
+    @property
     def tool_timeout(self) -> int:
         """
         Get local toolset timeout configuration.

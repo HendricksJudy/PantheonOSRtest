@@ -1150,7 +1150,7 @@ class Agent:
         if tool_call_id is not None:
             full_context["tool_call_id"] = tool_call_id
         full_context["_call_agent"] = _call_agent_wrap
-        full_context["caller_models"] = caller_models  # For scfm_router LLM calls
+        full_context["caller_models"] = caller_models  # Inherited models for tools that make nested LLM calls
 
         # Pre-inject output buffer for background task adoption on timeout
         if tool_call_id is not None:

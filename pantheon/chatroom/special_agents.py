@@ -5,12 +5,15 @@ This module centralizes all agents used for special tasks:
 - SummaryGenerator: Summarizes conversation context for sub-agent delegation
 - SuggestionGenerator: Generates contextual follow-up questions
 - ChatNameGenerator: Generates or updates chat names based on conversation
+- TeamDispatcher: Picks the most appropriate team template for a new chat's
+  first user message, based on the available team templates' metadata.
 
 These agents are used internally by the framework to enhance user experience
 and improve sub-agent delegation.
 """
 
 import asyncio
+import json
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -578,11 +581,172 @@ class ChatNameGenerator:
         })
 
 
+# ===== TeamDispatcher =====
+
+
+@dataclass
+class TeamSelection:
+    """Result of dispatching a new chat's first message to a team template."""
+
+    template_id: str
+    reason: str
+    confidence: float
+
+
+class TeamDispatcher:
+    """Select the best-matching team template for a new chat based on the first user message.
+
+    Uses an LLM to read each available team template's metadata (`id`, `name`,
+    `description`, `category`) and pick the most appropriate one. This keeps the
+    mechanism domain-agnostic: any future team (protein FM, drug FM, imaging FM…)
+    participates automatically as long as its template ships a clear `description`.
+
+    Fails closed: on any error (timeout, malformed JSON, unknown id), returns the
+    configured default_template_id with confidence=0.0 and never raises.
+    """
+
+    _LLM_TIMEOUT_SECONDS = 15.0
+    _INSTRUCTIONS = (
+        "You are a team dispatcher. Given the user's first message and a list of "
+        "available specialist teams (each with an id, name, description, and category), "
+        "pick the single most appropriate team's id. If no team is clearly more "
+        "appropriate than the generic assistant, return the default team's id. "
+        "Respond with strict JSON only in this exact shape: "
+        '{"template_id": "...", "reason": "...", "confidence": 0.0}. '
+        "Do not wrap the JSON in markdown or commentary."
+    )
+
+    def __init__(self) -> None:
+        self._dispatch_agent: Optional[Agent] = None
+        self._dispatch_agent_model: Optional[str] = None
+
+    async def select_team(
+        self,
+        user_message: str,
+        available_templates: List[Dict[str, Any]],
+        default_template_id: str,
+        *,
+        preferred_model: str | None = None,
+    ) -> TeamSelection:
+        """Classify the first user message into one of the available team template ids.
+
+        Args:
+            user_message: The first user message in a new chat.
+            available_templates: List of dicts, each with at least `id`, `name`,
+                `description`, and optionally `category`. Typically produced from
+                `template_manager.list_templates()` (via `dataclasses.asdict`).
+            default_template_id: Id to return on low-confidence matches or failure.
+            preferred_model: Model override; defaults to `get_current_run_model()`.
+
+        Returns:
+            TeamSelection with a guaranteed-valid template_id (one present in the
+            available_templates list, or `default_template_id`).
+        """
+        valid_ids = {t.get("id") for t in available_templates if t.get("id")}
+        if not valid_ids:
+            return TeamSelection(default_template_id, "no templates available", 0.0)
+        if default_template_id not in valid_ids:
+            # Defensive: caller passed a default that isn't in the list. Still return
+            # it verbatim — the caller will fall back to a hardcoded default.
+            pass
+
+        if not isinstance(user_message, str) or not user_message.strip():
+            return TeamSelection(default_template_id, "empty user message", 0.0)
+
+        preferred_model = preferred_model or get_current_run_model()
+
+        if (
+            self._dispatch_agent is None
+            or self._dispatch_agent_model != preferred_model
+        ):
+            self._dispatch_agent = Agent(
+                name="TeamDispatcher",
+                model=preferred_model,
+                instructions=self._INSTRUCTIONS,
+            )
+            self._dispatch_agent_model = preferred_model
+
+        teams_block = "\n".join(
+            f"- id: {t.get('id')} | name: {t.get('name', '')} | category: {t.get('category', '')} | description: {_compact(t.get('description', ''))}"
+            for t in available_templates
+        )
+        prompt = (
+            "AVAILABLE TEAMS:\n"
+            f"{teams_block}\n\n"
+            f"DEFAULT TEAM ID (use this if no other team is clearly a better match): {default_template_id}\n\n"
+            "USER MESSAGE:\n"
+            f"{user_message}\n\n"
+            'Respond with a single JSON object: {"template_id": "...", "reason": "...", "confidence": 0.0}.'
+        )
+
+        try:
+            with temporary_log_level("WARNING"):
+                response = await asyncio.wait_for(
+                    self._dispatch_agent.run(prompt),
+                    timeout=self._LLM_TIMEOUT_SECONDS,
+                )
+        except asyncio.TimeoutError:
+            logger.warning("TeamDispatcher timed out; falling back to default template")
+            return TeamSelection(default_template_id, "dispatcher timeout", 0.0)
+        except Exception as exc:
+            logger.warning(f"TeamDispatcher failed: {exc}")
+            return TeamSelection(default_template_id, f"dispatcher error: {exc}", 0.0)
+
+        content = getattr(response, "content", None) or str(response or "")
+        parsed = _extract_json_object(content)
+        if not isinstance(parsed, dict):
+            return TeamSelection(default_template_id, "dispatcher returned non-JSON", 0.0)
+
+        template_id = parsed.get("template_id")
+        reason = str(parsed.get("reason", "")).strip() or "no reason given"
+        try:
+            confidence = float(parsed.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        confidence = max(0.0, min(1.0, confidence))
+
+        if not isinstance(template_id, str) or template_id not in valid_ids:
+            return TeamSelection(
+                default_template_id,
+                f"dispatcher returned unknown id '{template_id}'",
+                0.0,
+            )
+
+        return TeamSelection(template_id, reason, confidence)
+
+
+def _compact(text: str, max_len: int = 200) -> str:
+    """Collapse whitespace and truncate for compact prompt listings."""
+    if not text:
+        return ""
+    flat = " ".join(str(text).split())
+    return flat if len(flat) <= max_len else flat[: max_len - 1] + "…"
+
+
+def _extract_json_object(text: str) -> Any:
+    """Best-effort extract of a JSON object from an LLM response."""
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            return json.loads(text[start : end + 1])
+        except json.JSONDecodeError:
+            return None
+    return None
+
+
 # ===== Singleton instances =====
 
 _summary_generator: Optional[SummaryGenerator] = None
 _suggestion_generator: Optional[SuggestionGenerator] = None
 _chat_name_generator: Optional[ChatNameGenerator] = None
+_team_dispatcher: Optional[TeamDispatcher] = None
 
 
 def get_summary_generator() -> SummaryGenerator:
@@ -607,3 +771,11 @@ def get_chat_name_generator() -> ChatNameGenerator:
     if _chat_name_generator is None:
         _chat_name_generator = ChatNameGenerator()
     return _chat_name_generator
+
+
+def get_team_dispatcher() -> TeamDispatcher:
+    """Get the global TeamDispatcher instance."""
+    global _team_dispatcher
+    if _team_dispatcher is None:
+        _team_dispatcher = TeamDispatcher()
+    return _team_dispatcher

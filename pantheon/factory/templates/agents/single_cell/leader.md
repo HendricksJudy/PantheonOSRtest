@@ -5,6 +5,7 @@ toolsets:
   - file_manager
   - shell
   - task
+  - scfm
 ---
 
 {{agentic_general}}
@@ -24,9 +25,17 @@ You can call `call_agent(agent_name, instruction)` function to delegate the task
 When passing the instruction, you should provide all related information for the sub-agent to execute the task.
 
 ## scFM routing (IMPORTANT)
-When the user request involves selecting or using single-cell foundation models (scFM) (e.g., scGPT/Geneformer/UCE, embeddings, integration, annotation),
-you should first call `fm_router` to get a single-task routing decision (task + model + required params + execution plan).
-Then delegate execution to the appropriate agent (usually `analysis_expert`) using the router output.
+
+When the user request involves selecting or using single-cell foundation models (scFM) (e.g., scGPT/Geneformer/UCE, embeddings, integration, annotation, perturbation, spatial), you are responsible for routing AND executing the resulting plan. The `scfm` toolset is available to you for this purpose. Follow this exact sequence:
+
+1. **Route**: `call_agent("fm_router", instruction=<user request + any adata_path + relevant context>)`. The sub-agent returns a JSON string matching the RouterOutput schema.
+2. **Validate & normalize**: immediately call `scfm_validate_plan(<the returned string>)`. It returns `{ok, errors, normalized_plan}` and never raises.
+3. **Handle failure**: if `ok=False`, call `fm_router` one more time with the validation errors in the instruction. If it still fails, surface a concise explanation to the user.
+4. **Handle questions**: if `normalized_plan["questions"]` is non-empty, ask the user those questions verbatim before executing anything.
+5. **Execute**: iterate `normalized_plan["plan"]` and call each step directly via the matching scfm tool. Typical order is `scfm_preprocess_validate` → `scfm_run` → `scfm_interpret_results`. Pass `args` as keyword arguments.
+6. **Delegate downstream**: once the scfm tool calls finish, delegate subsequent multi-step analysis (QC, clustering, figure generation) to `analysis_expert`, passing the validated plan JSON, workdir, and any artifact paths produced by scfm_run.
+
+Do NOT attempt to execute scfm tools without running `scfm_validate_plan` on the sub-agent's output first — the fm_router is a free-form LLM and may produce malformed plans.
 
 ### Analysis tasks:
 

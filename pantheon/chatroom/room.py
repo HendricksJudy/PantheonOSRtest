@@ -359,6 +359,98 @@ class ChatRoom(ToolSet):
             "agent_count": agent_count,
         }
 
+    async def _maybe_dispatch_team_for_new_chat(
+        self,
+        memory,
+        first_user_message: str,
+    ) -> dict | None:
+        """Run the LLM TeamDispatcher on the first message of a brand-new chat.
+
+        No-op (returns None) when any of the following hold:
+          - the chat already has a stored team_template in memory;
+          - `team_dispatcher_enabled` setting is False;
+          - no non-empty user message text is available;
+          - the dispatcher fails or picks the configured default.
+
+        When the dispatcher picks a non-default template, this method persists it to
+        memory (so the subsequent `get_team_for_chat` load finds it) and returns a
+        small notice dict `{"template_id", "template_name", "reason", "confidence"}`
+        that the caller may forward to the chat stream.
+        """
+        if not isinstance(first_user_message, str) or not first_user_message.strip():
+            return None
+        if getattr(memory, "extra_data", None) and memory.extra_data.get("team_template"):
+            return None
+
+        settings = get_settings()
+        if not settings.team_dispatcher_enabled:
+            return None
+
+        default_id = settings.default_team_template or "default"
+
+        try:
+            templates = self.template_manager.list_templates()
+        except Exception as exc:
+            logger.warning(f"TeamDispatcher: failed to list templates: {exc}")
+            return None
+
+        templates_payload: list[dict] = []
+        templates_by_id: dict[str, Any] = {}
+        for tmpl in templates:
+            try:
+                tmpl_dict = dataclasses.asdict(tmpl) if not isinstance(tmpl, dict) else tmpl
+            except Exception:
+                continue
+            tmpl_id = tmpl_dict.get("id")
+            if not tmpl_id:
+                continue
+            templates_payload.append({
+                "id": tmpl_id,
+                "name": tmpl_dict.get("name", tmpl_id),
+                "description": tmpl_dict.get("description", ""),
+                "category": tmpl_dict.get("category", ""),
+            })
+            templates_by_id[tmpl_id] = tmpl_dict
+
+        if not templates_payload:
+            return None
+
+        # Import lazily to avoid circular import at module load time.
+        from pantheon.chatroom.special_agents import get_team_dispatcher
+
+        selection = await get_team_dispatcher().select_team(
+            user_message=first_user_message,
+            available_templates=templates_payload,
+            default_template_id=default_id,
+        )
+
+        if selection.template_id == default_id:
+            return None
+
+        selected_template_dict = templates_by_id.get(selection.template_id)
+        if not selected_template_dict:
+            logger.warning(
+                f"TeamDispatcher returned id '{selection.template_id}' not found in templates"
+            )
+            return None
+
+        try:
+            self._save_team_template_to_memory(memory, selected_template_dict, persist=True)
+        except Exception as exc:
+            logger.warning(f"TeamDispatcher: failed to persist selected team: {exc}")
+            return None
+
+        logger.info(
+            f"TeamDispatcher routed new chat to '{selection.template_id}' "
+            f"(confidence={selection.confidence:.2f}): {selection.reason}"
+        )
+        return {
+            "template_id": selection.template_id,
+            "template_name": selected_template_dict.get("name", selection.template_id),
+            "reason": selection.reason,
+            "confidence": selection.confidence,
+        }
+
     async def get_team_for_chat(self, chat_id: str, save_to_memory: bool = True) -> PantheonTeam:
         """Get the team for a specific chat, creating from memory if needed."""
         # 0. If default_team is set, always use it (bypass template system)
@@ -392,12 +484,18 @@ class ChatRoom(ToolSet):
 
         team_template_dict = extra_data.get("team_template")
 
-        # If no template found, use default template
+        # If no template found, use configured default template (fallback to "default")
         if not team_template_dict:
+            configured_default_id = get_settings().default_team_template or "default"
             logger.info(
-                f"No team template in memory, creating default team for chat {chat_id}"
+                f"No team template in memory, creating team '{configured_default_id}' for chat {chat_id}"
             )
-            default_template = self.template_manager.get_template("default")
+            default_template = self.template_manager.get_template(configured_default_id)
+            if not default_template and configured_default_id != "default":
+                logger.warning(
+                    f"Configured default_team_template '{configured_default_id}' not found; falling back to 'default'"
+                )
+                default_template = self.template_manager.get_template("default")
             if not default_template:
                 raise RuntimeError("Default template not found in template manager")
 
@@ -1704,10 +1802,40 @@ class ChatRoom(ToolSet):
         async def team_getter():
             return await self.get_team_for_chat(chat_id)
 
+        # LLM-based team dispatcher for brand-new chats: if the chat has no team
+        # template stored yet and the setting is enabled, ask a small LLM to pick
+        # the best-matching specialist team from the available templates.
+        dispatch_notice: dict | None = None
+        try:
+            first_user_message = ""
+            if isinstance(message, list):
+                for m in message:
+                    if isinstance(m, dict) and m.get("role") == "user":
+                        content = m.get("_llm_content") or m.get("content") or ""
+                        if isinstance(content, str) and content.strip():
+                            first_user_message = content
+                            break
+            dispatch_notice = await self._maybe_dispatch_team_for_new_chat(
+                memory, first_user_message
+            )
+        except Exception as exc:
+            logger.warning(f"TeamDispatcher ingress failed: {exc}")
+
         # Wire bg task auto-notification for this chat
         # Resolve team early so we can set on_complete hooks before agent runs
         team = await self.get_team_for_chat(chat_id)
         self._setup_bg_auto_notify(chat_id, team)
+
+        if dispatch_notice is not None:
+            try:
+                logger.info(
+                    "Routed new chat '%s' to team '%s' (confidence=%.2f)",
+                    chat_id,
+                    dispatch_notice.get("template_id"),
+                    dispatch_notice.get("confidence", 0.0),
+                )
+            except Exception:
+                pass
 
         # Inject workdir from project metadata if in isolated mode
         project = memory.extra_data.get("project", {})
@@ -2034,9 +2162,12 @@ class ChatRoom(ToolSet):
                         "template": team_template_dict,
                     }
 
-            # No template found, return default template info
+            # No template found, return configured default template info
             template_manager = get_template_manager()
-            default_template = template_manager.get_template("default")
+            configured_default_id = get_settings().default_team_template or "default"
+            default_template = template_manager.get_template(configured_default_id)
+            if not default_template and configured_default_id != "default":
+                default_template = template_manager.get_template("default")
             if default_template:
                 return {
                     "success": True,

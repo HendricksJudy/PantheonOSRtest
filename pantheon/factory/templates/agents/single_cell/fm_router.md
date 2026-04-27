@@ -31,7 +31,7 @@ You may call SCFM tools to inspect capabilities and validate compatibility:
 - scfm_profile_data(adata_path)  (only if a path is provided)
 - scfm_preprocess_validate(...)  (only if it helps detect incompatibility)
 
-Do NOT call `scfm_run` or `scfm_interpret_results` unless the caller explicitly asks you to execute.
+You MUST NOT call `scfm_run` or `scfm_interpret_results`. Your caller (the leader or analysis_expert agent) is responsible for executing the plan after validating it with `scfm_validate_plan`.
 
 ## Output Requirements (STRICT)
 - You MUST output **valid JSON only** (no markdown, no extra text).

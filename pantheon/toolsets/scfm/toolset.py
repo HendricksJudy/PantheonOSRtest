@@ -9,7 +9,6 @@ import os
 import shutil
 import subprocess
 import tempfile
-import warnings
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -25,7 +24,7 @@ from .registry import (
     TaskType,
     get_registry,
 )
-from .router import build_model_cards, route_query
+from .router import _normalize_router_output_dict, validate_router_output
 
 
 class SCFMToolSet(ToolSet):
@@ -492,105 +491,6 @@ class SCFMToolSet(ToolSet):
         return "; ".join(reasons) if reasons else "general purpose model"
 
     # =========================================================================
-    # Router Tool
-    # =========================================================================
-
-    @tool
-    async def scfm_router(
-        self,
-        query: str,
-        adata_path: Optional[str] = None,
-        prefer_zero_shot: bool = True,
-        max_vram_gb: Optional[int] = None,
-        skill_ready_only: bool = False,
-        allow_partial: bool = True,
-        allow_reference: bool = False,
-        output_path: Optional[str] = None,
-        batch_key: Optional[str] = None,
-        label_key: Optional[str] = None,
-        context_variables: Optional[dict] = None,
-    ) -> dict[str, Any]:
-        """
-        DEPRECATED: LLM-based router for single-cell foundation model tasks.
-
-        Prefer the template-based router sub-agent `fm_router` inside `single_cell_team`
-        (call via `call_agent("fm_router", ...)`) for better integration with the
-        Pantheon Team + template system.
-
-        Takes a natural language query and returns:
-        - Inferred scFM task (embed/integrate/annotate/spatial/perturb/drug_response)
-        - Selected best-fit model from registry
-        - Resolved parameters (or clarifying questions)
-        - Executable tool-call plan
-
-        Args:
-            query: Natural language description of what the user wants to do
-            adata_path: Optional path to .h5ad file to profile for compatibility
-            prefer_zero_shot: Prefer zero-shot capable models when possible
-            max_vram_gb: Maximum VRAM constraint (filters models by hardware)
-            skill_ready_only: Only select fully skill-ready models
-            allow_partial: Allow partial-spec models in selection
-            allow_reference: Allow reference-only models in selection
-            output_path: Pre-specified output path for results
-            batch_key: Pre-specified batch key in .obs for integration
-            label_key: Pre-specified label key in .obs for annotation
-            context_variables: Execution context (injected automatically by agent)
-
-        Returns:
-            RouterOutput dict containing:
-            - intent: Inferred task with confidence
-            - inputs: Original query and adata_path
-            - data_profile: Data profile if adata was provided
-            - selection: Recommended model and fallbacks with rationale
-            - resolved_params: Resolved output_path, batch_key, label_key
-            - plan: Executable tool-call plan
-            - questions: Clarifying questions if parameters are ambiguous
-            - warnings: Compatibility or other warnings
-        """
-        warnings.warn(
-            "scfm_router is deprecated. Prefer using the template-based "
-            "`single_cell_team` router sub-agent via call_agent('fm_router', ...).",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        context = context_variables or {}
-
-        # Profile data if adata_path provided
-        data_profile = None
-        if adata_path:
-            data_profile = self._profile_data_impl(adata_path)
-            if "error" in data_profile:
-                # Don't fail completely, just note the error
-                data_profile = {"error": data_profile["error"], "adata_path": adata_path}
-
-        # Call the router
-        result = await route_query(
-            query=query,
-            context=context,
-            adata_path=adata_path,
-            data_profile=data_profile if data_profile and "error" not in data_profile else None,
-            prefer_zero_shot=prefer_zero_shot,
-            max_vram_gb=max_vram_gb,
-            skill_ready_only=skill_ready_only,
-            allow_partial=allow_partial,
-            allow_reference=allow_reference,
-            output_path=output_path,
-            batch_key=batch_key,
-            label_key=label_key,
-        )
-
-        # Include data profile error as warning if present
-        if data_profile and "error" in data_profile:
-            result.setdefault("warnings", []).append(f"Data profiling failed: {data_profile['error']}")
-
-        # Always include deprecation notice in-band for tool consumers
-        result.setdefault("warnings", []).append(
-            "DEPRECATED: scfm_router tool. Prefer `single_cell_team` + `fm_router` sub-agent (call_agent('fm_router', ...))."
-        )
-
-        return result
-
-    # =========================================================================
     # Validation Tools
     # =========================================================================
 
@@ -719,6 +619,62 @@ class SCFMToolSet(ToolSet):
                 "species": profile["species"],
                 "gene_scheme": profile["gene_scheme"],
             },
+        }
+
+    @tool
+    def scfm_validate_plan(self, plan: Any) -> dict[str, Any]:
+        """
+        Validate and normalize a router plan produced by the fm_router sub-agent.
+
+        Accepts either a JSON string or a dict matching the RouterOutput schema.
+        Applies light normalization (e.g., rewriting steps whose `tool` is a model
+        name into `scfm_run` with `model_name=<that model>`) and then validates
+        against the Pydantic schema plus the model registry.
+
+        Args:
+            plan: Raw JSON string or dict from the fm_router sub-agent.
+
+        Returns:
+            {
+                "ok": bool,
+                "errors": list[str],
+                "normalized_plan": dict | None,
+            }
+            Never raises.
+        """
+        if isinstance(plan, str):
+            try:
+                plan_dict = json.loads(plan)
+            except json.JSONDecodeError as exc:
+                return {
+                    "ok": False,
+                    "errors": [f"not valid JSON: {exc}"],
+                    "normalized_plan": None,
+                }
+        elif isinstance(plan, dict):
+            plan_dict = plan
+        else:
+            return {
+                "ok": False,
+                "errors": [f"plan must be a JSON string or dict, got {type(plan).__name__}"],
+                "normalized_plan": None,
+            }
+
+        try:
+            normalized = _normalize_router_output_dict(plan_dict)
+        except Exception as exc:
+            return {
+                "ok": False,
+                "errors": [f"normalization failed: {exc}"],
+                "normalized_plan": None,
+            }
+
+        is_valid, errors, parsed = validate_router_output(normalized)
+        normalized_plan = parsed.model_dump() if parsed is not None else normalized
+        return {
+            "ok": is_valid,
+            "errors": errors,
+            "normalized_plan": normalized_plan,
         }
 
     # =========================================================================

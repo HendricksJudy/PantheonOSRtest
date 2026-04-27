@@ -317,13 +317,25 @@ re-implement it in raw Python.
    filling in any missing values from the routing decision's
    `resolved_params` (e.g. `output_path`, `batch_key`, `label_key`) or
    from the leader's instruction.
-3. If `scfm_preprocess_validate` returns `status != "ready"`, apply the
-   suggested `auto_fixes` (or note them in the report) before calling
-   `scfm_run`.
-4. After `scfm_run` completes, call `scfm_interpret_results` on the output
-   path to produce QA metrics and UMAPs.
+3. Branch on the `scfm_preprocess_validate` result before calling
+   `scfm_run`:
+   - `status == "ready"` — proceed.
+   - `status == "needs_preprocessing"` — apply the suggested `auto_fixes`
+     to the data (or write the converted file under `{workdir}/data/`),
+     then re-run `scfm_preprocess_validate` on the fixed file. Only call
+     `scfm_run` once status is `"ready"`.
+   - `status == "incompatible"` — **do not call `scfm_run`**. Stop the
+     plan, record the validation `diagnostics` in `report_analysis.md`,
+     and return the failure to the leader so it can ask `fm_router` for
+     a different model (or surface the issue to the user). `scfm_run`
+     would only echo the same incompatibility error.
+4. Only call `scfm_interpret_results` after `scfm_run` returns
+   successfully (no `error` key, valid `output_path`). If `scfm_run`
+   errors out, skip interpretation and escalate the error and any
+   `validation` payload to the leader.
 5. Record provenance in `report_analysis.md` (model name, task, input/
-   output paths, key metrics).
+   output paths, key metrics, and any validation diagnostics that were
+   resolved or skipped).
 
 Only fall back to raw Python in `python_interpreter` when the plan needs a
 step the `scfm` toolset does not cover (e.g. custom plotting beyond

@@ -60,14 +60,31 @@ Do NOT call `scfm_run` or `scfm_interpret_results` unless the caller explicitly 
     {"tool": "<tool_name>", "args": {}}
   ],
   "questions": [
-    {"field": "<param_name>", "question": "<clarification_question>", "options": []}
+    {
+      "field": "<param_name>",
+      "header": "<short label, max 12 chars>",
+      "question": "<clarification_question>",
+      "input_type": "single_choice | multiple_choice | text_input",
+      "options": [
+        {"value": "<internal_value>", "label": "<short_display>", "description": "<longer_explanation>"}
+      ],
+      "required": true
+    }
   ],
   "warnings": []
 }
+
+## Questions schema (must match notify_user contract)
+- Each `questions[]` entry MUST be directly consumable by `notify_user` — the caller will pass them through.
+- Required keys per question: `header`, `question`, `input_type`. `field` records which router parameter the answer fills.
+- For `single_choice` / `multiple_choice`, `options` MUST be a list of dicts with `value`, `label`, `description`.
+- For `text_input`, omit `options` (or use `[]`).
+- Never emit `options` as plain strings — the GUI cannot render that.
 
 ## Routing Rules
 1. Single-task only: pick the primary task. If user asks multiple tasks, pick one and add questions.
 2. Choose models that match task + modality/species constraints when known.
 3. If you detect the recommended model is incompatible, prefer a compatible fallback. Only ask the user if no compatible option exists.
-4. If required params are missing (e.g., batch_key for integration), add a question.
+4. If required params are missing (e.g., batch_key for integration), add a question following the schema above.
 5. Always produce a sensible `plan` that the caller could execute via SCFM tools.
+6. When `questions` is non-empty, the calling agent should forward them via `notify_user(blocked_on_user=true, questions=...)`. Do NOT put the questions in the message text — only structured `questions` are interactive.

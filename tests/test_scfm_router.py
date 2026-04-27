@@ -19,6 +19,7 @@ from pantheon.toolsets.scfm.router import (
     ResolvedParams,
     ToolCall,
     Question,
+    Option,
     validate_router_output,
     build_model_cards,
     build_router_prompt,
@@ -110,7 +111,16 @@ class TestRouterOutput:
                 ToolCall(tool="scfm_run", args={}),
             ],
             questions=[
-                Question(field="batch_key", question="Which column?", options=["batch", "sample"])
+                Question(
+                    field="batch_key",
+                    header="batch_key",
+                    question="Which column?",
+                    input_type="single_choice",
+                    options=[
+                        Option(value="batch", label="batch"),
+                        Option(value="sample", label="sample"),
+                    ],
+                )
             ],
             warnings=["Data may need preprocessing"],
         )
@@ -209,6 +219,80 @@ class TestValidateRouterOutput:
         assert parsed is not None
         assert parsed.plan[0].tool == "scfm_run"
         assert parsed.plan[0].args["model_name"] == "scplantllm"
+
+    def test_legacy_question_shape_is_upgraded(self):
+        """Legacy {field, question, options: list[str]} should be upgraded to GUI shape."""
+        legacy = {
+            "intent": {"task": "integrate", "confidence": 0.8, "constraints": {}},
+            "inputs": {"query": "integrate this dataset"},
+            "selection": {
+                "recommended": {"name": "scgpt", "rationale": "best for integration"},
+                "fallbacks": [],
+            },
+            "questions": [
+                {
+                    "field": "batch_key",
+                    "question": "Which column contains batch info?",
+                    "options": ["batch", "sample_id"],
+                }
+            ],
+        }
+        is_valid, errors, parsed = validate_router_output(legacy)
+        assert is_valid, errors
+        assert parsed is not None
+        q = parsed.questions[0]
+        assert q.field == "batch_key"
+        assert q.header == "batch_key"
+        assert q.input_type == "single_choice"
+        assert [o.value for o in q.options] == ["batch", "sample_id"]
+        assert q.required is True
+
+    def test_text_input_question_with_no_options_is_inferred(self):
+        """A legacy question with empty options should infer text_input."""
+        legacy = {
+            "intent": {"task": "embed", "confidence": 0.9, "constraints": {}},
+            "inputs": {"query": "embed my data"},
+            "selection": {
+                "recommended": {"name": "uce", "rationale": ""},
+                "fallbacks": [],
+            },
+            "questions": [
+                {"field": "output_path", "question": "Where to save results?", "options": []}
+            ],
+        }
+        is_valid, errors, parsed = validate_router_output(legacy)
+        assert is_valid, errors
+        q = parsed.questions[0]
+        assert q.input_type == "text_input"
+        assert q.options == []
+
+    def test_new_shape_passes_through_unchanged(self):
+        """A question already in the new shape should not be mutated."""
+        new_shape = {
+            "intent": {"task": "embed", "confidence": 0.9, "constraints": {}},
+            "inputs": {"query": "embed my data"},
+            "selection": {
+                "recommended": {"name": "uce", "rationale": ""},
+                "fallbacks": [],
+            },
+            "questions": [
+                {
+                    "field": "batch_key",
+                    "header": "batch_key",
+                    "question": "Pick a column",
+                    "input_type": "single_choice",
+                    "options": [
+                        {"value": "batch", "label": "Batch", "description": "Sequencing batch"},
+                    ],
+                    "required": True,
+                }
+            ],
+        }
+        is_valid, errors, parsed = validate_router_output(new_shape)
+        assert is_valid, errors
+        q = parsed.questions[0]
+        assert q.options[0].label == "Batch"
+        assert q.options[0].description == "Sequencing batch"
 
 
 # =============================================================================

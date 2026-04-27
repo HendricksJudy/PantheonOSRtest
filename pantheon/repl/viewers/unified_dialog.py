@@ -162,6 +162,55 @@ class UnifiedReviewDialog:
 
         return result
 
+    @staticmethod
+    def _normalize_question(q: Any, fallback_index: int) -> dict:
+        """Coerce a question dict into the shape this dialog can render.
+
+        Defends against legacy router-style payloads (``options: list[str]``,
+        no ``input_type``, no ``header``) reaching the dialog. Idempotent: a
+        well-formed question passes through unchanged.
+        """
+        if not isinstance(q, dict):
+            q = {}
+        else:
+            q = dict(q)  # shallow copy so caller's dict is untouched
+
+        raw_options = q.get('options')
+        normalized_options: List[dict] = []
+        if isinstance(raw_options, list):
+            for opt in raw_options:
+                if isinstance(opt, str):
+                    normalized_options.append({
+                        'value': opt,
+                        'label': opt,
+                        'description': '',
+                    })
+                elif isinstance(opt, dict):
+                    value = opt.get('value', opt.get('label', ''))
+                    label = opt.get('label', opt.get('value', ''))
+                    description = opt.get('description', '')
+                    normalized_options.append({
+                        'value': str(value),
+                        'label': str(label) if label else str(value),
+                        'description': str(description) if description else '',
+                    })
+        q['options'] = normalized_options
+
+        if not q.get('input_type'):
+            q['input_type'] = 'single_choice' if normalized_options else 'text_input'
+
+        if not q.get('header'):
+            field = q.get('field') or ''
+            q['header'] = (field[:12] if field else f'Q{fallback_index + 1}')
+
+        if 'required' not in q:
+            q['required'] = True
+
+        if not isinstance(q.get('question'), str):
+            q['question'] = ''
+
+        return q
+
     def _build_tabs(self):
         """Build tab list from files and questions."""
         tab_index = 1
@@ -192,6 +241,8 @@ class UnifiedReviewDialog:
 
         # Add question tabs
         for i, q in enumerate(self.questions):
+            q = self._normalize_question(q, i)
+            self.questions[i] = q
             # Short label for tab
             header = q.get('header', f'Q{i+1}')
 

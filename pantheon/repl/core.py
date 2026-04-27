@@ -1345,16 +1345,25 @@ class Repl(ReplUI):
                     elif step.get("role") == "tool":
                         tool_name = step.get("tool_name", "")
                         content = step.get("content", "")
-                        
+
                         # Update Task UI
                         self.task_ui_renderer.update_tool_complete(tool_name)
-                        
+
                         # Handle notify_user result
                         if "notify_user" in tool_name:
                             pass # Handled in tool_calls phase
 
                         # Prefer raw_content if available (original dict)
                         raw_content = step.get("raw_content")
+
+                        # Bridge: surface router questions to the unified dialog.
+                        # scfm_router (and any future router tool) returns
+                        # `questions` as part of its result without calling
+                        # notify_user, so we promote them to a pending approval
+                        # here. The dialog/answer roundtrip is handled by
+                        # _handle_pending_approval, the same path notify_user uses.
+                        if tool_name and "router" in tool_name.lower():
+                            self._maybe_promote_router_questions(tool_name, raw_content, content)
                         
                         # Display in scrollback (filtered in compact mode with active task)
                         if self._should_display_tool_in_scrollback(tool_name):
@@ -1502,6 +1511,82 @@ class Repl(ReplUI):
         if self._pending_approval:
             await self._handle_pending_approval()
     
+    def _maybe_promote_router_questions(
+        self,
+        tool_name: str,
+        raw_content: Any,
+        content: Any,
+    ) -> None:
+        """If a router-style tool returned `questions`, queue an interactive dialog.
+
+        scfm_router (and the template-based fm_router) emit a `questions` list
+        in their result without calling notify_user. Without this bridge those
+        questions would only ever land in the LLM's context, so the user
+        rarely sees them. We promote a well-formed result into the same
+        ``_pending_approval`` slot used by notify_user; ``_handle_pending_approval``
+        then drives the unified dialog and feeds answers back into the chat.
+        """
+        result = raw_content if isinstance(raw_content, dict) else None
+        if result is None and isinstance(content, str) and content.strip():
+            try:
+                import json as _json
+                parsed = _json.loads(content)
+                if isinstance(parsed, dict):
+                    result = parsed
+            except Exception:
+                try:
+                    import ast as _ast
+                    parsed = _ast.literal_eval(content)
+                    if isinstance(parsed, dict):
+                        result = parsed
+                except Exception:
+                    return
+
+        if not isinstance(result, dict):
+            return
+
+        questions = result.get("questions")
+        if not isinstance(questions, list) or not questions:
+            return
+
+        # Defensive shape filter — drop entries that wouldn't render. The
+        # unified_dialog normalizer will repair partial shapes, but a question
+        # without text is useless either way.
+        valid_questions = [
+            q for q in questions
+            if isinstance(q, dict) and isinstance(q.get("question"), str) and q["question"].strip()
+        ]
+        if not valid_questions:
+            return
+
+        # Don't clobber an existing pending notify_user approval.
+        if self._pending_approval:
+            return
+
+        rationale = ""
+        try:
+            rec = result.get("selection", {}).get("recommended", {}) or {}
+            rationale = rec.get("rationale", "") or ""
+        except Exception:
+            rationale = ""
+        warnings_list = result.get("warnings") or []
+        warning_lines = [w for w in warnings_list if isinstance(w, str) and w.strip()]
+
+        message_parts: list[str] = []
+        if rationale:
+            message_parts.append(f"**{tool_name}** suggests: {rationale}")
+        else:
+            message_parts.append(f"**{tool_name}** needs clarification before continuing.")
+        if warning_lines:
+            message_parts.append("\n".join(f"- {w}" for w in warning_lines[:6]))
+
+        self._pending_approval = {
+            "message": "\n\n".join(message_parts),
+            "paths": [],
+            "interrupt": True,
+            "questions": valid_questions,
+        }
+
     async def _handle_pending_approval(self):
         """Handle pending user approval with interactive dialog.
 

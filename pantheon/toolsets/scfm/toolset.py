@@ -583,11 +583,6 @@ class SCFMToolSet(ToolSet):
         if data_profile and "error" in data_profile:
             result.setdefault("warnings", []).append(f"Data profiling failed: {data_profile['error']}")
 
-        # Always include deprecation notice in-band for tool consumers
-        result.setdefault("warnings", []).append(
-            "DEPRECATED: scfm_router tool. Prefer `single_cell_team` + `fm_router` sub-agent (call_agent('fm_router', ...))."
-        )
-
         return result
 
     # =========================================================================

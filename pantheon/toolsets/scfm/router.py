@@ -10,7 +10,7 @@ Takes a natural language query and returns:
 
 import json
 import re
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -40,37 +40,88 @@ VALID_SCFM_TOOLS = [
 ]
 
 
-def _normalize_router_output_dict(output_dict: dict[str, Any]) -> dict[str, Any]:
-    """Normalize common LLM plan mistakes into valid SCFM router output.
+def _upgrade_question_dict(q: dict[str, Any]) -> dict[str, Any]:
+    """Upgrade a legacy router question dict to the GUI-compatible shape.
 
-    In practice the router sometimes emits a model name such as ``scplantllm``
-    as the plan tool. Convert those steps into ``scfm_run`` with
-    ``model_name=<that model>`` while preserving the original args.
+    Older router prompts emitted ``{field, question, options: list[str]}``.
+    The GUI dialog and ``notify_user`` validator require
+    ``{header, question, input_type, options: [{value,label,description}], required}``.
+    This helper performs that conversion in-place-style and is idempotent for
+    questions that already match the new shape.
+    """
+    if not isinstance(q, dict):
+        return q
+
+    field = q.get("field") or ""
+
+    if not q.get("header"):
+        q["header"] = (field[:12] if field else "Clarify")
+
+    raw_options = q.get("options")
+    upgraded_options: list[dict[str, Any]] = []
+    if isinstance(raw_options, list):
+        for opt in raw_options:
+            if isinstance(opt, str):
+                upgraded_options.append({"value": opt, "label": opt, "description": ""})
+            elif isinstance(opt, dict):
+                value = opt.get("value") or opt.get("label") or ""
+                label = opt.get("label") or opt.get("value") or value
+                description = opt.get("description", "")
+                upgraded_options.append({
+                    "value": str(value),
+                    "label": str(label),
+                    "description": str(description),
+                })
+    q["options"] = upgraded_options
+
+    if not q.get("input_type"):
+        q["input_type"] = "single_choice" if upgraded_options else "text_input"
+
+    if "required" not in q:
+        q["required"] = True
+
+    return q
+
+
+def _normalize_router_output_dict(output_dict: dict[str, Any]) -> dict[str, Any]:
+    """Normalize common LLM mistakes into valid SCFM router output.
+
+    Two normalizations live here:
+
+    1. Plan tool fixup: the router sometimes emits a model name such as
+       ``scplantllm`` as the plan tool. Convert those steps into ``scfm_run``
+       with ``model_name=<that model>`` while preserving the original args.
+    2. Question shape upgrade: convert legacy
+       ``{field, question, options: list[str]}`` questions into the GUI
+       dialog contract via ``_upgrade_question_dict``.
     """
     if not isinstance(output_dict, dict):
         return output_dict
 
     normalized = json.loads(json.dumps(output_dict))
     registry = get_registry()
+
     plan = normalized.get("plan")
-    if not isinstance(plan, list):
-        return normalized
+    if isinstance(plan, list):
+        for step in plan:
+            if not isinstance(step, dict):
+                continue
+            tool_name = step.get("tool")
+            if not isinstance(tool_name, str) or tool_name in VALID_SCFM_TOOLS:
+                continue
+            if registry.get(tool_name.lower()) is None:
+                continue
 
-    for step in plan:
-        if not isinstance(step, dict):
-            continue
-        tool_name = step.get("tool")
-        if not isinstance(tool_name, str) or tool_name in VALID_SCFM_TOOLS:
-            continue
-        if registry.get(tool_name.lower()) is None:
-            continue
+            args = step.get("args")
+            if not isinstance(args, dict):
+                args = {}
+                step["args"] = args
+            args.setdefault("model_name", tool_name.lower())
+            step["tool"] = "scfm_run"
 
-        args = step.get("args")
-        if not isinstance(args, dict):
-            args = {}
-            step["args"] = args
-        args.setdefault("model_name", tool_name.lower())
-        step["tool"] = "scfm_run"
+    questions = normalized.get("questions")
+    if isinstance(questions, list):
+        normalized["questions"] = [_upgrade_question_dict(q) for q in questions]
 
     return normalized
 
@@ -117,10 +168,26 @@ Return a JSON object with this exact structure:
     {"tool": "<tool_name>", "args": {}}
   ],
   "questions": [
-    {"field": "<param_name>", "question": "<clarification_question>", "options": []}
+    {
+      "field": "<param_name>",
+      "header": "<short label, max 12 chars, e.g. 'batch_key'>",
+      "question": "<clarification_question>",
+      "input_type": "single_choice | multiple_choice | text_input",
+      "options": [
+        {"value": "<internal_value>", "label": "<short_display>", "description": "<longer_explanation>"}
+      ],
+      "required": true
+    }
   ],
   "warnings": []
 }
+
+## Questions schema (must match notify_user contract)
+- Each question MUST include `header`, `question`, and `input_type`.
+- For `single_choice` / `multiple_choice`, `options` MUST be a list of dicts with `value`, `label`, `description`.
+- For `text_input`, omit `options` (or pass `[]`).
+- Use `field` to record the parameter name the answer fills (e.g. `batch_key`); use `header` for the short tab label shown in the GUI.
+- Do NOT emit `options` as a list of plain strings — the GUI cannot render that shape.
 
 ## CRITICAL: Model Selection Rules
 
@@ -225,11 +292,29 @@ class ToolCall(BaseModel):
         return v
 
 
+class Option(BaseModel):
+    """A single selectable option in a clarifying question."""
+    value: str = Field(..., description="Internal value returned when this option is selected")
+    label: str = Field(..., description="Short display text for the option")
+    description: str = Field(default="", description="Longer explanation shown next to the label")
+
+
 class Question(BaseModel):
-    """A clarifying question for the user."""
+    """A clarifying question for the user.
+
+    Shape matches the contract enforced by ``notify_user`` (see
+    ``pantheon/toolsets/task/task_toolset.py``) so that router questions can be
+    handed straight to the unified dialog without a converter.
+    """
     field: str = Field(..., description="Parameter field this question is about")
-    question: str = Field(..., description="The question to ask")
-    options: list[str] = Field(default_factory=list, description="Suggested options if applicable")
+    header: str = Field(default="", description="Short tab label (<=12 chars). Defaults to field if empty.")
+    question: str = Field(..., description="The question text shown to the user")
+    input_type: Literal["single_choice", "multiple_choice", "text_input"] = Field(
+        default="single_choice",
+        description="Widget type to render in the dialog",
+    )
+    options: list[Option] = Field(default_factory=list, description="Selectable options for choice types")
+    required: bool = Field(default=True, description="Whether this question must be answered")
 
 
 class RouterOutput(BaseModel):
@@ -721,12 +806,31 @@ async def route_query(
                         reroute_result["warnings"].insert(0, f"Rerouted from '{model_name}' to '{new_model}' due to incompatibility")
                         return reroute_result
                     else:
-                        # Still incompatible after reroute - add questions
-                        result.setdefault("questions", []).append({
+                        # Still incompatible after reroute - ask the user to pick.
+                        compat_map = data_profile.get("model_compatibility", {})
+                        candidates = [
+                            m for m in registry.find_models()
+                            if compat_map.get(m.name.lower(), {}).get("compatible", True)
+                        ]
+                        compat_options = [
+                            {
+                                "value": m.name.lower(),
+                                "label": m.name,
+                                "description": (m.differentiator or m.prefer_when or "").strip(),
+                            }
+                            for m in candidates
+                        ]
+                        result.setdefault("questions", []).append(_upgrade_question_dict({
                             "field": "model_name",
-                            "question": f"Both '{model_name}' and '{new_model}' are incompatible with your data. Please select a model manually.",
-                            "options": [m.name for m in registry.find_models() if data_profile.get("model_compatibility", {}).get(m.name.lower(), {}).get("compatible", True)][:5]
-                        })
+                            "header": "model_name",
+                            "question": (
+                                f"Both '{model_name}' and '{new_model}' are incompatible with your data. "
+                                "Please select a compatible model."
+                            ),
+                            "input_type": "single_choice",
+                            "options": compat_options,
+                            "required": True,
+                        }))
                 else:
                     # Reroute failed - suggest fallback in warnings
                     if result.get("selection", {}).get("fallbacks"):
